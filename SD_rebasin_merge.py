@@ -21,7 +21,9 @@ args = parser.parse_args()
 device = args.device
 
 def flatten_params(model):
-  return model["state_dict"]
+  global device
+  k = read_state_dict(model, map_location=device)
+  return k
 
 checkpoint_dict_replacements = {
     'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
@@ -88,7 +90,9 @@ if args.vae is not None:
       vae = torch.load(args.vae, map_location=device)
 
 theta_0 = read_state_dict(args.model_a, map_location=device)
+theta_0_a = theta_0
 theta_1 = read_state_dict(args.model_b, map_location=device)
+theta_1_a = theta_1
 
 alpha = float(args.alpha)
 iterations = int(args.iterations)
@@ -116,8 +120,10 @@ for x in range(iterations):
     else:
         new_alpha = step
     print(f"new alpha = {new_alpha}\n")
-    
-    theta_0 = {key: (1 - (new_alpha)) * theta_0[key] + (new_alpha) * value for key, value in theta_1.items() if "model" in key and key in theta_1}
+
+    for key in tqdm.tqdm(theta_1.keys(),desc="Merging:"):
+      if "model" in key and key in theta_1:
+        theta_0[key] = (1 - (new_alpha)) * theta_0[key] + (new_alpha) * theta_1[key]
 
     if x == 0:
         for key in theta_1.keys():
@@ -127,9 +133,9 @@ for x in range(iterations):
     print("FINDING PERMUTATIONS")
 
     # Replace theta_0 with a permutated version using model A and B    
-    first_permutation, y = weight_matching(permutation_spec, flatten_params(model_a), theta_0, usefp16=args.usefp16)
+    first_permutation, y = weight_matching(permutation_spec, theta_0_a, theta_0, usefp16=args.usefp16)
     theta_0 = apply_permutation(permutation_spec, first_permutation, theta_0)
-    second_permutation, z = weight_matching(permutation_spec, flatten_params(model_b), theta_0, usefp16=args.usefp16)
+    second_permutation, z = weight_matching(permutation_spec, theta_1_a, theta_0, usefp16=args.usefp16)
     theta_3= apply_permutation(permutation_spec, second_permutation, theta_0)
 
     new_alpha = torch.nn.functional.normalize(torch.sigmoid(torch.Tensor([y, z])), p=1, dim=0).tolist()[0]
