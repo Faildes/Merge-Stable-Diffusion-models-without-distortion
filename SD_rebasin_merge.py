@@ -1,16 +1,20 @@
 import argparse
 import torch
 import os
+import safetensors.torch
+import tqdm
 
 from weight_matching import sdunet_permutation_spec, weight_matching, apply_permutation
 
 
 parser = argparse.ArgumentParser(description= "Merge two stable diffusion models with git re-basin")
-parser.add_argument("--model_a", type=str, help="Path to model a")
-parser.add_argument("--model_b", type=str, help="Path to model b")
+parser.add_argument("model_a", type=str, help="Path to model a")
+parser.add_argument("model_b", type=str, help="Path to model b")
+parser.add_argument("--vae", type=str, help="Path to vae", default=None, required=False)
 parser.add_argument("--device", type=str, help="Device to use, defaults to cpu", default="cpu", required=False)
 parser.add_argument("--output", type=str, help="Output file name, without extension", default="merged", required=False)
-parser.add_argument("--usefp16", type=str, help="Whether to use half precision", default=True, required=False)
+parser.add_argument("--usefp16", type=bool, help="Whether to use half precision", default=True, required=False)
+parser.add_argument("--save_safetensors", type=bool, help="Whether to save as .safetensors", default=False, required=False)
 parser.add_argument("--alpha", type=str, help="Ratio of model A to B", default="0.5", required=False)
 parser.add_argument("--iterations", type=str, help="Number of steps to take before reaching alpha", default="10", required=False)
 args = parser.parse_args()   
@@ -19,10 +23,72 @@ device = args.device
 def flatten_params(model):
   return model["state_dict"]
 
-model_a = torch.load(args.model_a, map_location=device)
-model_b = torch.load(args.model_b, map_location=device)
-theta_0 = model_a["state_dict"]
-theta_1 = model_b["state_dict"]
+checkpoint_dict_replacements = {
+    'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
+    'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
+    'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
+}
+
+checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
+
+def transform_checkpoint_dict_key(k):
+  for text, replacement in checkpoint_dict_replacements.items():
+      if k.startswith(text):
+          k = replacement + k[len(text):]
+
+  return k
+
+def get_state_dict_from_checkpoint(pl_sd):
+  pl_sd = pl_sd.pop("state_dict", pl_sd)
+  pl_sd.pop("state_dict", None)
+
+  sd = {}
+  for k, v in pl_sd.items():
+      new_key = transform_checkpoint_dict_key(k)
+
+      if new_key is not None:
+          sd[new_key] = v
+
+  pl_sd.clear()
+  pl_sd.update(sd)
+
+  return pl_sd
+
+def read_state_dict(checkpoint_file, print_global_state=False, map_location=None):
+  _, extension = os.path.splitext(checkpoint_file)
+  if extension.lower() == ".safetensors":
+      device = map_location
+      pl_sd = safetensors.torch.load_file(checkpoint_file, device=device)
+  else:
+      pl_sd = torch.load(checkpoint_file, map_location=map_location)
+
+  if print_global_state and "global_step" in pl_sd:
+      print(f"Global Step: {pl_sd['global_step']}")
+
+  sd = get_state_dict_from_checkpoint(pl_sd)
+  return sd
+
+_, extension_a = os.path.splitext(args.model_a)
+if extension_a.lower() == ".safetensors":
+    model_a = safetensors.torch.load_file(args.model_a, device=device)
+else:
+    model_a = torch.load(args.model_a, map_location=device)
+
+_, extension_b = os.path.splitext(args.model_b)
+if extension_b.lower() == ".safetensors":
+    model_b = safetensors.torch.load_file(args.model_b, device=device)
+else:
+    model_b = torch.load(args.model_b, map_location=device)
+
+if args.vae is not None:
+  _, extension_vae = os.path.splitext(args.vae)
+  if extension_vae.lower() == ".safetensors":
+      vae = safetensors.torch.load_file(args.vae, device=device)
+  else:
+      vae = torch.load(args.vae, map_location=device)
+
+theta_0 = read_state_dict(args.model_a, map_location=device)
+theta_1 = read_state_dict(args.model_b, map_location=device)
 
 alpha = float(args.alpha)
 iterations = int(args.iterations)
@@ -50,8 +116,7 @@ for x in range(iterations):
     else:
         new_alpha = step
     print(f"new alpha = {new_alpha}\n")
-
-
+    
     theta_0 = {key: (1 - (new_alpha)) * theta_0[key] + (new_alpha) * value for key, value in theta_1.items() if "model" in key and key in theta_1}
 
     if x == 0:
@@ -73,8 +138,10 @@ for x in range(iterations):
     
     for key in special_keys:
         theta_0[key] = (1 - new_alpha) * (theta_0[key]) + (new_alpha) * (theta_3[key])
-
-output_file = f'{args.output}.ckpt'
+if args.save_safetensors:
+  output_file = f'{args.output}.safetensors'
+else:
+  output_file = f'{args.output}.ckpt'
 
 # check if output file already exists, ask to overwrite
 if os.path.isfile(output_file):
@@ -90,9 +157,9 @@ if os.path.isfile(output_file):
             print("Please enter y or n")
 
 print("\nSaving...")
-
-torch.save({
-        "state_dict": theta_0
-            }, output_file)
+if args.save_safetensors:
+  safetensors.torch.save_file(theta_0, output_file, metadata={"format": "pt"})
+else:
+  torch.save({"state_dict": theta_0}, output_file)
 
 print("Done!")
